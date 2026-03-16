@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>8th Wall Image Target Demo</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
+    #camerafeed { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: #111; }
+    #status-panel {
+      position: fixed; top: 16px; left: 16px; right: 16px;
+      background: rgba(0,0,0,0.75); color: #fff; border-radius: 12px;
+      padding: 14px 18px; font-size: 14px; z-index: 100;
+    }
+    #status-panel h3 { font-size: 16px; margin-bottom: 8px; }
+    .status-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+    .dot-gray { background: #666; }
+    .dot-yellow { background: #f5a623; animation: pulse 1s infinite; }
+    .dot-green { background: #4cd964; }
+    .dot-red { background: #ff3b30; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+    #found-overlay {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      pointer-events: none; z-index: 50;
+      border: 6px solid transparent; transition: border-color 0.3s;
+    }
+    #found-overlay.active { border-color: #4cd964; }
+    #target-info {
+      position: fixed; bottom: 80px; left: 16px; right: 16px;
+      background: rgba(0,180,80,0.9); color: #fff; border-radius: 12px;
+      padding: 16px 20px; font-size: 14px; z-index: 100;
+      transform: translateY(200px); transition: transform 0.4s ease;
+    }
+    #target-info.visible { transform: translateY(0); }
+    #target-info h3 { font-size: 18px; margin-bottom: 6px; }
+    #target-info .coord { font-family: monospace; font-size: 13px; line-height: 1.6; white-space: pre; }
+    #bottom-bar {
+      position: fixed; bottom: 16px; left: 16px; right: 16px;
+      display: flex; gap: 10px; z-index: 100;
+    }
+    #bottom-bar button {
+      flex: 1; padding: 14px; border: none; border-radius: 10px;
+      font-size: 15px; font-weight: 600; cursor: pointer;
+      background: rgba(255,255,255,0.9); color: #333;
+    }
+    #loading-mask {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      background: #111; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; z-index: 200;
+      color: #fff; font-size: 16px; transition: opacity 0.5s;
+    }
+    #loading-mask.hidden { opacity: 0; pointer-events: none; }
+    .spinner {
+      width: 40px; height: 40px; border: 4px solid rgba(255,255,255,0.2);
+      border-top-color: #fff; border-radius: 50%;
+      animation: spin 0.8s linear infinite; margin-bottom: 16px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #error-panel {
+      position: fixed; top: 50%; left: 16px; right: 16px;
+      transform: translateY(-50%); background: rgba(200,30,30,0.9);
+      color: #fff; border-radius: 12px; padding: 20px;
+      z-index: 300; display: none; font-size: 14px; line-height: 1.6;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="camerafeed"></canvas>
+  <script>
+    (function() {
+      var c = document.getElementById('camerafeed');
+      function resize() {
+        var dpr = window.devicePixelRatio || 1;
+        c.width = window.innerWidth * dpr;
+        c.height = window.innerHeight * dpr;
+      }
+      resize();
+      window.addEventListener('resize', resize);
+    })();
+  </script>
+  <div id="found-overlay"></div>
+  <div id="status-panel">
+    <h3>Image Target Demo</h3>
+    <div class="status-row"><span class="dot dot-gray" id="dot-engine"></span><span id="text-engine">引擎加载中...</span></div>
+    <div class="status-row"><span class="dot dot-gray" id="dot-camera"></span><span id="text-camera">等待摄像头...</span></div>
+    <div class="status-row"><span class="dot dot-gray" id="dot-target"></span><span id="text-target">等待图像目标...</span></div>
+  </div>
+  <div id="target-info"><h3 id="target-name"></h3><div class="coord" id="target-coords"></div></div>
+  <div id="bottom-bar">
+    <button id="btn-show-target">查看目标图</button>
+  </div>
+  <div id="loading-mask"><div class="spinner"></div><div>正在加载引擎...</div></div>
+  <div id="error-panel"><div id="error-text"></div></div>
+
+  <script src="./xr-standalone/xr.js" data-preload-chunks="slam"></script>
+
+  <script>
+    function setStatus(id, state, text) {
+      document.getElementById('dot-' + id).className = 'dot dot-' + state;
+      document.getElementById('text-' + id).textContent = text;
+    }
+    function showError(msg) {
+      document.getElementById('error-text').textContent = msg;
+      document.getElementById('error-panel').style.display = 'block';
+    }
+    function fmt(v) { return v !== undefined ? v.toFixed(3) : '-'; }
+
+    // Show the original target image in a new window (DOM API, no HTML strings)
+    document.getElementById('btn-show-target').onclick = function() {
+      var w = window.open('');
+      if (!w) { alert('Please allow popups'); return; }
+      var d = w.document;
+      d.title = 'Target Image';
+      d.body.style.cssText = 'display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;background:#f5f5f5;font-family:sans-serif;margin:0';
+      var h = d.createElement('h2');
+      h.textContent = 'Scan this image';
+      h.style.marginBottom = '16px';
+      var img = d.createElement('img');
+      img.src = './image-targets/01_original.jpg';
+      img.style.cssText = 'max-width:90vw;max-height:70vh;border:2px solid #333';
+      var p = d.createElement('p');
+      p.textContent = 'Display this on another screen, then point the camera at it.';
+      p.style.cssText = 'margin-top:16px;color:#666;font-size:14px;text-align:center;max-width:400px';
+      d.body.appendChild(h);
+      d.body.appendChild(img);
+      d.body.appendChild(p);
+    };
+
+    // ===== Image target data from CLI (01.json) =====
+    var IMAGE_TARGET_DATA = [
+      {
+        name: '01',
+        imagePath: './image-targets/01_luminance.jpg',
+        type: 'PLANAR',
+        metadata: null,
+        properties: {
+          left: 0,
+          top: 18,
+          width: 536,
+          height: 715,
+          isRotated: true,
+          originalWidth: 536,
+          originalHeight: 750
+        }
+      }
+    ];
+
+    // ===== AR main =====
+    window.addEventListener('xrloaded', function() {
+      setStatus('engine', 'green', '引擎已加载');
+      document.getElementById('loading-mask').classList.add('hidden');
+      console.log('[demo] XR8 loaded');
+
+      var foundOverlay = document.getElementById('found-overlay');
+      var targetInfo   = document.getElementById('target-info');
+      var targetNameEl = document.getElementById('target-name');
+      var targetCoords = document.getElementById('target-coords');
+
+      function updateCoords(d) {
+        var p = d.position || {}, r = d.rotation || {};
+        targetCoords.textContent =
+          'pos  x=' + fmt(p.x) + ' y=' + fmt(p.y) + ' z=' + fmt(p.z) + '\n' +
+          'rot  x=' + fmt(r.x) + ' y=' + fmt(r.y) + ' z=' + fmt(r.z) + ' w=' + fmt(r.w) + '\n' +
+          'scale=' + fmt(d.scale);
+      }
+
+      var myModule = {
+        name: 'image-target-demo',
+        listeners: [
+          { event: 'reality.imageloading', process: function() {
+            setStatus('target', 'yellow', '加载目标图像...');
+            console.log('[demo] imageloading');
+          }},
+          { event: 'reality.imagescanning', process: function(e) {
+            var n = e.detail && e.detail.imageTargets ? e.detail.imageTargets.length : 0;
+            setStatus('target', 'yellow', '扫描中... (' + n + ' targets)');
+            console.log('[demo] imagescanning, targets:', n);
+          }},
+          { event: 'reality.imagefound', process: function(e) {
+            var d = e.detail;
+            console.log('[demo] FOUND:', d.name, d);
+            setStatus('target', 'green', 'FOUND: ' + d.name);
+            foundOverlay.classList.add('active');
+            targetInfo.classList.add('visible');
+            targetNameEl.textContent = 'Found: ' + d.name;
+            updateCoords(d);
+          }},
+          { event: 'reality.imageupdated', process: function(e) {
+            updateCoords(e.detail);
+          }},
+          { event: 'reality.imagelost', process: function(e) {
+            console.log('[demo] LOST:', e.detail.name);
+            setStatus('target', 'yellow', 'Lost, scanning...');
+            foundOverlay.classList.remove('active');
+            targetInfo.classList.remove('visible');
+          }},
+        ]
+      };
+
+      var startModule = {
+        name: 'start-listener',
+        onStart: function() {
+          setStatus('camera', 'green', '摄像头已启动');
+          console.log('[demo] camera started');
+        },
+        onException: function(err) {
+          setStatus('camera', 'red', 'Error');
+          showError(err.message || String(err));
+        }
+      };
+
+      try {
+        XR8.addCameraPipelineModules([
+          XR8.GlTextureRenderer.pipelineModule(),
+          XR8.XrController.pipelineModule(),
+          startModule,
+          myModule,
+        ]);
+
+        XR8.XrController.configure({
+          disableWorldTracking: true,
+          imageTargetData: IMAGE_TARGET_DATA,
+        });
+
+        setStatus('camera', 'yellow', '请求摄像头...');
+        XR8.run({ canvas: document.getElementById('camerafeed') });
+      } catch (err) {
+        console.error(err);
+        showError(err.message);
+      }
+    });
+
+    setTimeout(function() {
+      if (!window.XR8) {
+        setStatus('engine', 'red', '超时');
+        showError('Engine load timeout.');
+        document.getElementById('loading-mask').classList.add('hidden');
+      }
+    }, 20000);
+  </script>
+</body>
+</html>
